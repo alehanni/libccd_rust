@@ -10,3 +10,6 @@ cmake = "0.1"
 
 [dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+glam = "0.24"

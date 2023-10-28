@@ -1,54 +1,14 @@
-
-/*
-
-rust wrapper for libccd
-
-intersection functions take userdata pointers (representing the colliding instances) and a ccd_t struct which provides state and configurations
-
--we want to define support functions in rust
--we cant call c functions directly due to their inherently unsafe design
--ccd_t can probably be created and initialized in rust
--userdata pointers are only passed on to be dereferenced in our own (rust) functions
-
-- we need a glue function that takes pure rust support functions and configures ccd_t accordingly
-
-
-
-ccd_vec3_t is an array of 3 ccd_real_t (aka doubles or floats)
-
-this means that our rust api could possibly look like:
-    
-    fn ccd_gjk_intersect<T>(support1: fn([T; 3]) -> [T; 3], support2: fn([T; 3]) -> [T; 3]) -> IntersectResult
-
-    alternatively:
-
-    fn ccd_gjk_intersect<T: Into<[f64; 3]>>(support1: fn(T) -> T, support2: fn(T) -> T) -> IntersectResult
-
-    or:
-
-    fn ccd_gjk_intersect<T: Into<[f64; 3]>, F: Fn(T) -> T>(support1: F, support2: F) -> IntersectResult
-
-
-use fn prepare_ccd_t
-
-
-TODO:
-    -implement ccd_t in accordance with the c-spec
-        -requires ccd_first_dir_fn type => function pointer that takes two userdata pointers and a vec3 pointer to write results
-        -requires ccd_support_fn type   => function pointer that takes a userdata pointer, a direction vector pointer, and a vec3 pointer to write results
-        -requires ccd_center_fn         => function pointer that takes a userdata pointer and a vec3 pointer to write results
-        -requires unsigned long
-        -requires ccd_real_t type       => chosen to be float or double when building libccd.a
-
-*/
-
 #![allow(non_snake_case, non_camel_case_types, unused_must_use, dead_code)]
 use libc::{c_void, c_int, c_long, c_ulong};
 
 mod ffi {
-    use libc::{c_void, c_int, c_double, c_ulong};
+    use libc::{c_void, c_int, c_float, c_double, c_ulong};
 
-    pub type ccd_real_t = c_double; // IMPORTANT: libccd.a uses ccd_real_t <=> float OR double depending on compile flags (double is default)
+    #[cfg(use_double = "yes")]
+    pub type ccd_real_t = c_double;
+
+    #[cfg(not(use_double = "yes"))]
+    pub type ccd_real_t = c_float;
 
     #[repr(C)]
     #[derive(Copy, Clone)]
@@ -77,7 +37,6 @@ mod ffi {
         pub dist_tolerance: ccd_real_t,
     }
 
-    //#[link(name = "ccd", kind = "static")]
     extern "C" {
         pub fn ccdFirstDirDefault(o1: *const c_void, o2: *const c_void, dir: *mut ccd_vec3_t);
         pub fn ccdGJKIntersect(obj1: *const c_void, obj2: *const c_void, ccd: *const ccd_t) -> c_int;
@@ -101,23 +60,25 @@ fn ccd_new() -> ffi::ccd_t {
 }
 
 
-extern "C" fn support_callback<F>(userdata: *const c_void, dir: *const ffi::ccd_vec3_t, vec: *mut ffi::ccd_vec3_t)
+extern "C" fn support_callback<F, T>(userdata: *const c_void, dir: *const ffi::ccd_vec3_t, vec: *mut ffi::ccd_vec3_t)
 where
-    F: FnMut(ffi::ccd_vec3_t) -> ffi::ccd_vec3_t + 'static,
+    F: FnMut(T) -> T + 'static,
+    T: Into<[ffi::ccd_real_t; 3]> + From<[ffi::ccd_real_t; 3]>,
 {
     let support_ptr = userdata as *mut F; // cast userdata as closure
     unsafe {
         let support = &mut (*support_ptr); // get reference to closure
-        *vec = support(*dir); // call closure
+        (*vec).v = support((*dir).v.into()).into(); // convert to/from generic type and call closure
         println!("vec.v: {:?}", (*vec).v);
     }
 }
 
 
-fn ccd_gjk_intersect<F, G>(support1: F, support2: G) -> bool
+fn ccd_gjk_intersect<F, G, T>(support1: F, support2: G) -> bool
 where
-    F: FnMut(ffi::ccd_vec3_t) -> ffi::ccd_vec3_t + 'static,
-    G: FnMut(ffi::ccd_vec3_t) -> ffi::ccd_vec3_t + 'static,
+    F: FnMut(T) -> T + 'static,
+    G: FnMut(T) -> T + 'static,
+    T: Into<[ffi::ccd_real_t; 3]> + From<[ffi::ccd_real_t; 3]>,
 {
     // move closures to heap
     let support1_data = Box::into_raw(Box::new(support1));
@@ -125,16 +86,17 @@ where
 
     // prepare state
     let mut ccd = ccd_new();
-    ccd.support1 = Some(support_callback::<F>);
-    ccd.support2 = Some(support_callback::<G>);
+    ccd.support1 = Some(support_callback::<F, T>);
+    ccd.support2 = Some(support_callback::<G, T>);
     ccd.max_iterations = 100;
 
-    // call foreign function
-    let result: c_int;
-    unsafe{ result = ffi::ccdGJKIntersect(support1_data as *const _, support2_data as *const _, &ccd as *const _) as i32; }
     
-    // take back the raw pointers
+    let result: c_int;
     unsafe {
+        // call foreign function
+        result = ffi::ccdGJKIntersect(support1_data as *const _, support2_data as *const _, &ccd as *const _) as i32;
+
+        // take back the raw pointers
         Box::from_raw(support1_data as *mut F);
         Box::from_raw(support2_data as *mut F);
     }
@@ -146,34 +108,30 @@ where
 #[cfg(test)]
 mod tests {
 
-    use crate::ffi;
     use crate::ccd_gjk_intersect;
+    use glam::DVec3;
 
     #[test]
     fn pls_no_crash() {
 
         // closure for sphere 1
-        let sphere_support_1 = |dir: ffi::ccd_vec3_t| -> ffi::ccd_vec3_t {
+        let sphere_support_1 = |dir: DVec3| -> DVec3 {
 
-            let len = (dir.v[0]*dir.v[0] + dir.v[1]*dir.v[1] + dir.v[2]*dir.v[2]).sqrt();
-            let (dx, dy, dz) = (dir.v[0] / len, dir.v[1] / len, dir.v[2] / len);
+            let dir = dir.normalize();
+            let origin = DVec3::new(1.0, 0.0, 0.0);
+            let radius = 2.0;
 
-            let (ox, oy, oz) = (1.0, 0.0, 0.0);
-            let r = 2.0;
-
-            return ffi::ccd_vec3_t { v: [ox + dx * r, oy + dy * r, oz + dz * r] };
+            return origin + dir * radius;
         };
 
         // closure for sphere 2
-        let sphere_support_2 = |dir: ffi::ccd_vec3_t| -> ffi::ccd_vec3_t {
-            
-            let len = (dir.v[0]*dir.v[0] + dir.v[1]*dir.v[1] + dir.v[2]*dir.v[2]).sqrt();
-            let (dx, dy, dz) = (dir.v[0] / len, dir.v[1] / len, dir.v[2] / len);
-            
-            let (ox, oy, oz) = (-1.0, 0.0, 0.0);
-            let r = 2.0;
+        let sphere_support_2 = |dir: DVec3| -> DVec3 {
 
-            return ffi::ccd_vec3_t { v: [ox + dx * r, oy + dy * r, oz + dz * r] };
+            let dir = dir.normalize();
+            let origin = DVec3::new(-1.0, 0.0, 0.0);
+            let radius = 2.0;
+
+            return origin + dir * radius;
         };
 
         let result = ccd_gjk_intersect(sphere_support_1, sphere_support_2);
