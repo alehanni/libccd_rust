@@ -62,44 +62,35 @@ fn ccd_new() -> ffi::ccd_t {
 
 extern "C" fn support_callback<F, T>(userdata: *const c_void, dir: *const ffi::ccd_vec3_t, vec: *mut ffi::ccd_vec3_t)
 where
-    F: FnMut(T) -> T + 'static,
+    F: Fn(T) -> T,
     T: Into<[ffi::ccd_real_t; 3]> + From<[ffi::ccd_real_t; 3]>,
 {
     let support_ptr = userdata as *mut F; // cast userdata as closure
     unsafe {
         let support = &mut (*support_ptr); // get reference to closure
         (*vec).v = support((*dir).v.into()).into(); // convert to/from generic type and call closure
-        println!("vec.v: {:?}", (*vec).v);
     }
 }
 
 
-fn ccd_gjk_intersect<F, G, T>(support1: F, support2: G) -> bool
+pub fn ccd_gjk_intersect<F, G, T>(support1: &F, support2: &G) -> bool
 where
-    F: FnMut(T) -> T + 'static,
-    G: FnMut(T) -> T + 'static,
+    F: Fn(T) -> T,
+    G: Fn(T) -> T,
     T: Into<[ffi::ccd_real_t; 3]> + From<[ffi::ccd_real_t; 3]>,
 {
-    // move closures to heap
-    let support1_data = Box::into_raw(Box::new(support1));
-    let support2_data = Box::into_raw(Box::new(support2));
+    // get void pointers to closures
+    let support1_ptr = (support1 as *const _) as *const c_void;
+    let support2_ptr = (support2 as *const _) as *const c_void;
 
     // prepare state
     let mut ccd = ccd_new();
     ccd.support1 = Some(support_callback::<F, T>);
     ccd.support2 = Some(support_callback::<G, T>);
     ccd.max_iterations = 100;
-
     
     let result: c_int;
-    unsafe {
-        // call foreign function
-        result = ffi::ccdGJKIntersect(support1_data as *const _, support2_data as *const _, &ccd as *const _) as i32;
-
-        // take back the raw pointers
-        Box::from_raw(support1_data as *mut F);
-        Box::from_raw(support2_data as *mut F);
-    }
+    unsafe { result = ffi::ccdGJKIntersect(support1_ptr, support2_ptr, &ccd as *const _); }
 
     return result == 1;
 }
@@ -109,32 +100,32 @@ where
 mod tests {
 
     use crate::ccd_gjk_intersect;
-    use glam::DVec3;
+    use glam::Vec3;
 
     #[test]
-    fn pls_no_crash() {
+    fn basic_test() {
 
         // closure for sphere 1
-        let sphere_support_1 = |dir: DVec3| -> DVec3 {
+        let sphere_support_1 = |dir: Vec3| -> Vec3 {
 
             let dir = dir.normalize();
-            let origin = DVec3::new(1.0, 0.0, 0.0);
+            let origin = Vec3::new(1.0, 0.0, 0.0);
             let radius = 2.0;
 
             return origin + dir * radius;
         };
 
         // closure for sphere 2
-        let sphere_support_2 = |dir: DVec3| -> DVec3 {
+        let sphere_support_2 = |dir: Vec3| -> Vec3 {
 
             let dir = dir.normalize();
-            let origin = DVec3::new(-1.0, 0.0, 0.0);
+            let origin = Vec3::new(-1.0, 0.0, 0.0);
             let radius = 2.0;
 
             return origin + dir * radius;
         };
 
-        let result = ccd_gjk_intersect(sphere_support_1, sphere_support_2);
+        let result = ccd_gjk_intersect(&sphere_support_1, &sphere_support_2);
 
         assert_eq!(result, true);
     }

@@ -1,6 +1,6 @@
 use cmake::Config;
 
-const USE_DOUBLE: bool = true;
+const USE_DOUBLE: bool = false;
 
 fn main() {
 
